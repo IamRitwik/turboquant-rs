@@ -14,7 +14,7 @@ Vectors: 5000 × L2-normalized random (simulated KV cache entries)
 Method               Dim  Bits/el    Ratio          MSE   Cosine-Sim       Compress     Decompress
                                    vs FP16                                 (Mvec/s)       (Mvec/s)
 ──────────────────────────────────────────────────────────────────────────────────────────────────
-INT8                 512      8.0     1.97x      0.00000      1.00000         1.0553         3.3782
+INT8                 512      8.0     1.97x      ~0.00000     ~1.00000        1.0553         3.3782
 PolarQ-4bit          512      4.0     4.00x      0.00003      0.99274         0.0219         0.0044
 PolarQ-3bit          512      3.0     5.33x      0.00011      0.97145         0.0238         0.0044
 ```
@@ -23,7 +23,7 @@ PolarQ-3bit          512      3.0     5.33x      0.00011      0.97145         0.
 
 ▶ **PolarQuant-4bit vs INT8 at d=512:**
 * Compression ratio: 4.00x vs 1.97x (2.0x better)
-* Near-perfect Cosine Similarity: 0.99274 vs 1.00000
+* Near-perfect Cosine Similarity: 0.99274 vs ~1.00000
 
 ▶ **PolarQuant-3bit at d=512:**
 * 5.33x compression with low MSE (0.00011) and great cosine similarity (0.97145).
@@ -66,7 +66,7 @@ turboquant-rs/
 ## Running the Demo
 
 ```bash
-git clone https://github.com/iamritwik/turboquant-rs
+git clone https://github.com/IamRitwik/turboquant-rs.git
 cd turboquant-rs
 cargo run --example demo --release
 ```

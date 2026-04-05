@@ -6,10 +6,10 @@ description = "Rust implementation of Google's TurboQuant KV-cache compression a
 authors = ["Ritwik Mukhopadhyay"]
 license = "MIT"
 readme = "README.md"
-repository = "https://github.com/iamritwik/turboquant-rs"
+repository = "https://github.com/IamRitwik/turboquant-rs"
 keywords = ["quantization", "llm", "kv-cache", "compression", "rust"]
 categories = ["algorithms", "science", "multimedia::encoding"]
-homepage = "https://github.com/iamritwik/turboquant-rs"
+homepage = "https://github.com/IamRitwik/turboquant-rs"
 
 [lib]
 name = "turboquant"
