@@ -1,0 +1,49 @@
+[package]
+name = "turboquant-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Rust implementation of Google's TurboQuant KV-cache compression algorithm (arXiv:2504.19874)"
+authors = ["Ritwik Mukhopadhyay"]
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/iamritwik/turboquant-rs"
+keywords = ["quantization", "llm", "kv-cache", "compression", "rust"]
+categories = ["algorithms", "science", "multimedia::encoding"]
+homepage = "https://github.com/iamritwik/turboquant-rs"
+
+[lib]
+name = "turboquant"
+path = "src/lib.rs"
+
+[[bin]]
+name = "turboquant-rs"
+path = "src/main.rs"
+
+[[example]]
+name = "demo"
+path = "examples/demo.rs"
+
+[[bench]]
+name = "compression"
+harness = false
+
+[dependencies]
+ndarray = { version = "0.16", features = ["rayon"] }
+ndarray-rand = "0.15"
+rand = "0.8"
+rand_distr = "0.4"
+rayon = "1.10"
+half = "2.4"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+
+[profile.bench]
+opt-level = 3
+lto = true
+codegen-units = 1
