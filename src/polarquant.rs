@@ -1,16 +1,21 @@
 //! PolarQuant — Stage 1 of TurboQuant.
 //!
-//! ## Algorithm (from arXiv:2504.19874)
+//! ## Algorithm (from arXiv:2502.02617)
 //!
 //! ### Compression
 //! 1. Apply a precomputed random orthogonal rotation matrix Π to the input vector:
-//!    `v' = Π · v`
-//!    This makes the distribution data-oblivious (coordinates concentrate around
-//!    a Beta distribution, independent of input statistics).
+//!    `v' = Π · v`. For a unit-norm vector, coordinates are approximately Gaussian
+//!    N(0, 1/d), making their pairwise polar radii follow a Rayleigh(σ = 1/√d) distribution.
 //!
 //! 2. Group consecutive pairs of rotated coordinates (x₂ᵢ₋₁, x₂ᵢ) and convert
 //!    to polar form:
 //!    `r = sqrt(x² + y²)`,  `θ = atan2(y, x)`
+//!    For Gaussian coordinates, pairwise radii follow a Rayleigh distribution.
+//!
+//!    > [!NOTE]
+//!    > This implementation uses a **Pairwise PolarQuant variant**. The original 
+//!    > paper (arXiv:2502.02617) describes a recursive polar transformation. This 
+//!    > version uses independent pairwise transforms for simplicity.
 //!
 //! 3. Quantize r and θ independently using precomputed Lloyd-Max codebooks.
 //!    Because the distribution is data-oblivious, codebooks are universal —
@@ -101,34 +106,68 @@ impl PolarQuant {
 
     /// Compress a vector of length `dim` (as f16) to a packed byte representation.
     ///
-    /// This is the preferred method for performance as it avoids extra allocations.
+    /// This is the preferred method for performance as it avoids an extra copy.
     pub fn compress_f16(&self, v: &[f16]) -> Vec<u8> {
         assert_eq!(v.len(), self.dim, "Input length mismatch");
 
-        // Step 1: rotate (streaming to f32)
-        let v_arr = Array1::from_iter(v.iter().map(|&val| val.to_f32()));
+        // Calculate L2 norm as f32
+        let norm_f32: f32 = v.iter()
+            .map(|&x| {
+                let x32 = x.to_f32();
+                x32 * x32
+            })
+            .sum::<f32>()
+            .sqrt()
+            .max(1e-10); // avoid division by zero
+        let norm_f16 = f16::from_f32(norm_f32);
+        
+        // Step 1: normalize and rotate
+        let v_arr = Array1::from_iter(v.iter().map(|&val| val.to_f32() / norm_f32));
         let rotated = self.rotation.dot(&v_arr);
 
         // Step 2 & 3: shared quantization and packing
-        self.compress_rotated_internal(rotated)
+        let mut packed = self.compress_rotated_internal(rotated);
+
+        // Prepend FP16 norm (2 bytes, little-endian)
+        let norm_bytes = norm_f16.to_le_bytes();
+        let mut out = Vec::with_capacity(packed.len() + 2);
+        out.extend_from_slice(&norm_bytes);
+        out.append(&mut packed);
+        out
     }
 
     /// Compress a vector of length `dim` (original f32 method).
     pub fn compress(&self, v: &[f32]) -> Vec<u8> {
         assert_eq!(v.len(), self.dim, "Input length mismatch");
 
-        // Step 1: rotate
-        let v_arr = Array1::from_vec(v.to_vec());
+        // Calculate L2 norm
+        let norm_f32: f32 = v.iter().map(|&x| x * x).sum::<f32>().sqrt().max(1e-10);
+        let norm_f16 = f16::from_f32(norm_f32);
+
+        // Step 1: normalize and rotate
+        // Use from_iter to avoid unnecessary clones or explicit allocation of intermediate f32 vec
+        let v_arr = Array1::from_iter(v.iter().map(|&x| x / norm_f32));
         let rotated = self.rotation.dot(&v_arr);
 
-        self.compress_rotated_internal(rotated)
+        let mut packed = self.compress_rotated_internal(rotated);
+
+        // Prepend FP16 norm
+        let norm_bytes = norm_f16.to_le_bytes();
+        let mut out = Vec::with_capacity(packed.len() + 2);
+        out.extend_from_slice(&norm_bytes);
+        out.append(&mut packed);
+        out
     }
 
     /// Shared internal logic for quantizing and packing rotated coordinates.
     fn compress_rotated_internal(&self, rotated: Array1<f32>) -> Vec<u8> {
         // Step 2: polar transform + quantize pairs
         let mut indices: Vec<u8> = Vec::with_capacity(self.dim);
-        for chunk in rotated.as_slice().unwrap().chunks(2) {
+        
+        let rotated_slice = rotated.as_slice()
+            .expect("Rotated array should be contiguous for pairwise chunking");
+            
+        for chunk in rotated_slice.chunks(2) {
             let x = chunk[0];
             let y = chunk[1];
             let r = (x * x + y * y).sqrt();
@@ -154,8 +193,15 @@ impl PolarQuant {
 
     /// Shared internal logic for dequantizing and inverting rotation.
     fn decompress_internal(&self, compressed: &[u8]) -> Array1<f32> {
+        assert!(compressed.len() >= 2, "Compressed payload too short");
+
+        // Extract norm from the first 2 bytes
+        let norm_bytes = [compressed[0], compressed[1]];
+        let norm = f16::from_le_bytes(norm_bytes).to_f32();
+        let payload = &compressed[2..];
+
         // Unpack bit fields
-        let indices = unpack_bits(compressed, self.bits, self.dim);
+        let indices = unpack_bits(payload, self.bits, self.dim);
 
         // Reconstruct polar → Cartesian
         let mut rotated = Vec::with_capacity(self.dim);
@@ -168,24 +214,32 @@ impl PolarQuant {
 
         // Apply inverse rotation (Πᵀ = Π⁻¹ since Π is orthogonal)
         let v_rot = Array1::from_vec(rotated);
-        self.rotation.t().dot(&v_rot)
+        let mut reconstructed = self.rotation.t().dot(&v_rot);
+
+        // Multiply by norm
+        reconstructed *= norm;
+        reconstructed
     }
 
     /// Return the number of bytes used to compress one vector.
     pub fn compressed_bytes(&self) -> usize {
         let total_bits = self.dim * self.bits as usize;
-        (total_bits + 7) / 8
+        let payload_bytes = (total_bits + 7) / 8;
+        payload_bytes + 2 // include 2 bytes for FP16 norm
     }
 
     /// Return the compression ratio vs FP16 (16 bits / element).
     pub fn compression_ratio(&self) -> f32 {
-        16.0 / self.bits as f32
+        let original_bits = self.dim as f32 * 16.0;
+        let compressed_bits = self.compressed_bytes() as f32 * 8.0;
+        original_bits / compressed_bits
     }
 
     /// Return the effective bits per element.
     ///
-    /// Since we store two `bits`-wide indices for every pair of elements
-    /// (one for radius, one for angle), the average overhead is `bits` per element.
+    /// This represents the bit-width of the core payload (quantized radius + angle
+    /// indices). Note that the actual compressed size includes a 2-byte FP16
+    /// norm overhead per vector.
     pub fn bits_per_element(&self) -> f32 {
         self.bits as f32
     }
@@ -349,11 +403,40 @@ mod tests {
     }
 
     #[test]
+    fn test_unnormalized_vectors() {
+        let dim = 128;
+        let pq = PolarQuant::new(dim, 4, Some(42));
+        
+        // Create a vector with a large norm (not 1.0)
+        let v_base = random_vector(dim, 7);
+        let v: Vec<f32> = v_base.iter().map(|&x| x * 10.0).collect();
+        let original_norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!(original_norm > 5.0);
+
+        let compressed = pq.compress(&v);
+        let reconstructed = pq.decompress(&compressed);
+        
+        let rec_norm = reconstructed.iter().map(|x| x * x).sum::<f32>().sqrt();
+        
+        // The norm should be preserved (within FP16 precision)
+        assert!((rec_norm - original_norm).abs() / original_norm < 0.01, 
+            "Norm not preserved: expected {original_norm}, got {rec_norm}");
+
+        let error = mse(&v, &reconstructed);
+        // SNR should be high (MSE should be low relative to the norm)
+        let relative_error = error / (original_norm * original_norm / dim as f32);
+        assert!(relative_error < 0.02, "Relative MSE {relative_error} too high");
+    }
+
+    #[test]
     fn test_compression_ratio() {
         let pq_4 = PolarQuant::new(128, 4, Some(42));
         let pq_3 = PolarQuant::new(128, 3, Some(42));
-        // FP16 baseline = 16 bits per element → ratio = 16/bits
-        assert!((pq_4.compression_ratio() - 4.0).abs() < 0.01);
-        assert!((pq_3.compression_ratio() - 5.333).abs() < 0.01);
+        
+        // For dim=128:
+        // 4-bit: (128*16) / (((128*4+7)/8 + 2) * 8) = 2048 / (66 * 8) = 2048 / 528 ≈ 3.878
+        // 3-bit: (128*16) / (((128*3+7)/8 + 2) * 8) = 2048 / (50 * 8) = 2048 / 400 = 5.12
+        assert!((pq_4.compression_ratio() - 3.878).abs() < 0.01);
+        assert!((pq_3.compression_ratio() - 5.12).abs() < 0.01);
     }
 }

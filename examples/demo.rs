@@ -160,9 +160,11 @@ fn benchmark_polarquant(vectors: &[Vec<f16>], dim: usize, bits: u8) -> BenchResu
 fn print_header() {
     println!();
     println!("\x1b[1;36m╔══════════════════════════════════════════════════════════════════════════════════════════════════════════════╗\x1b[0m");
-    println!("\x1b[1;36m║           turboquant-rs  ·  TurboQuant KV-Cache Compression  ·  M1 MacBook Air Benchmarks                   ║\x1b[0m");
-    println!("\x1b[1;36m║           arXiv:2504.19874  ·  ICLR 2026  ·  Google Research                                               ║\x1b[0m");
+    println!("\x1b[1;36m║           turboquant-rs  ·  PolarQuant & TurboQuant KV-Cache Compression           ║\x1b[0m");
+    println!("\x1b[1;36m║           Google Research & NYU  ·  AISTATS 2026  ·  ICLR 2026                      ║\x1b[0m");
     println!("\x1b[1;36m╚══════════════════════════════════════════════════════════════════════════════════════════════════════════════╝\x1b[0m");
+    println!();
+    println!("\x1b[90mBased on: PolarQuant (arXiv:2502.02617), TurboQuant (arXiv:2504.19874)\x1b[0m");
     println!();
     println!("\x1b[90mVectors: {N_VECTORS} × L2-normalized random (simulated KV cache entries)\x1b[0m");
     println!();
@@ -248,11 +250,11 @@ fn print_summary(results: &[BenchResult]) {
     }
 
     println!();
-    println!("  \x1b[90m▸ Why PolarQuant is faster:\x1b[0m");
-    println!("    INT8 requires two O(d) passes: (1) scan for min/max, (2) scale+round.");
-    println!("    PolarQuant's rotation makes the distribution data-oblivious, so the");
-    println!("    quantizer codebook is precomputed offline. Compress = matmul + atan2 + lookup.");
-    println!("    For large d, the one-time rotation cost amortizes over batch inference.");
+    println!("  \x1b[90m▸ Throughput Insights:\x1b[0m");
+    println!("    INT8 is vectorized and extremely fast for small d. PolarQuant's current");
+    println!("    implementation uses a dense O(d²) rotation matrix Π. In production, this");
+    println!("    would be replaced by a Fast Walsh-Hadamard Transform (O(d log d)) as");
+    println!("    described in the PolarQuant paper to achieve competitive throughput.");
     println!();
     println!("  \x1b[90m▸ Memory savings at KV cache scale (LLaMA-3 8B, 128K context):\x1b[0m");
     println!("    FP16 baseline (32 layers, 8 KV heads, d=128) ≈ 17.1 GB");

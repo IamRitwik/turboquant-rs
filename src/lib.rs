@@ -11,8 +11,8 @@
 //! 1. **PolarQuant** – applies a random orthogonal rotation to make the vector distribution
 //!    data-oblivious (concentrated Beta), then quantizes in polar coordinates using
 //!    precomputed Lloyd-Max codebooks. No per-block normalization needed.
-//! 2. **QJL residual** – stores the sign bits of a Johnson-Lindenstrauss projection of
-//!    the quantization residual for unbiased inner-product estimation.
+//! 2. **QJL Stage** – applies a Hadamard-based randomized transform (Fast JL) to the
+//!    quantization residual and stores signs to ensure an unbiased inner-product.
 //!
 //! This crate implements Stage 1 (PolarQuant) and a naive INT8 baseline for benchmarking.
 

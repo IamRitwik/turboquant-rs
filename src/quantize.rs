@@ -134,12 +134,11 @@ where
 
 /// Build the optimal radius quantizer for PolarQuant.
 ///
-/// After orthogonal rotation, pairs of coordinates (x, y) satisfy:
-///   r = sqrt(x² + y²) ~ Chi distribution with 2 DOF (scaled)
+/// After orthogonal rotation, each coordinate component satisfies x,y ~ N(0, 1/d)
+/// for unit-norm vectors, so the pairwise radius satisfies:
+///   r = sqrt(x² + y²) ~ Rayleigh(σ) where σ = 1/sqrt(d)
 ///
-/// For a d-dimensional unit-normalized vector:
-///   Each component ~ N(0, 1/d), so r ~ Chi(2) * (1/sqrt(d)) * sqrt(d/2)
-///   In practice r is in [0, 1] range when vectors are normalized.
+/// In practice r is in [0, 1] range when vectors are normalized.
 ///
 /// We approximate with Monte Carlo sampling.
 pub fn build_radius_quantizer<R: Rng>(levels: usize, dim: usize, mut rng: R) -> ScalarQuantizer {
