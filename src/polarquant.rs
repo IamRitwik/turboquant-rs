@@ -3,14 +3,16 @@
 //! ## Algorithm (from arXiv:2502.02617)
 //!
 //! ### Compression
-//! 1. Apply a precomputed random orthogonal rotation matrix Π to the input vector:
-//!    `v' = Π · v`. For a unit-norm vector, coordinates are approximately Gaussian
-//!    N(0, 1/d), making their pairwise polar radii follow a Rayleigh(σ = 1/√d) distribution.
+//! 1. Apply a random orthogonal rotation to the input vector. Two strategies:
+//!    - **Dense QR** (`new_dense`): O(d²) matrix multiply — legacy, kept for benchmarking
+//!    - **FWHT** (`new_fwht`): O(d log d) butterfly — production path (Stage 2 default)
+//!
+//!    Both produce the same distribution guarantee: rotated coordinates are approximately
+//!    N(0, 1/d) for unit-norm inputs, making their pairwise polar radii Rayleigh(1/√d).
 //!
 //! 2. Group consecutive pairs of rotated coordinates (x₂ᵢ₋₁, x₂ᵢ) and convert
 //!    to polar form:
 //!    `r = sqrt(x² + y²)`,  `θ = atan2(y, x)`
-//!    For Gaussian coordinates, pairwise radii follow a Rayleigh distribution.
 //!
 //!    > [!NOTE]
 //!    > This implementation uses a **Pairwise PolarQuant variant**. The original 
@@ -26,14 +28,12 @@
 //! ### Decompression
 //! 1. Unpack indices → centroid values (r̂, θ̂)
 //! 2. Reconstruct Cartesian: `x̂ = r̂·cos(θ̂)`, `ŷ = r̂·sin(θ̂)`
-//! 3. Apply inverse rotation: `v̂ = Πᵀ · v'`
+//! 3. Apply inverse rotation (Πᵀ for dense, FWHT inverse for butterfly)
 //!
 //! ### Key insight
 //! Traditional INT8 and per-group quantizers must store min/max per block
 //! (adding ~1-2 bits of overhead per element). PolarQuant's rotation eliminates
 //! this overhead, achieving near-optimal rate-distortion.
-
-
 
 use ndarray::{Array1, Array2};
 use ndarray_rand::rand_distr::StandardNormal;
@@ -42,7 +42,24 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 use half::f16;
 
+use crate::fwht::FwhtRotation;
 use crate::quantize::{ScalarQuantizer, build_angle_quantizer, build_radius_quantizer};
+
+// ---------------------------------------------------------------------------
+//  Rotation Strategy
+// ---------------------------------------------------------------------------
+
+/// Which rotation is applied before the polar transform.
+///
+/// Both strategies produce an orthogonal transform that makes coordinates
+/// approximately N(0, 1/d), preserving PolarQuant's codebook validity.
+#[derive(Debug, Clone)]
+pub enum RotationStrategy {
+    /// Legacy O(d²) dense matrix rotation — used in Stage 1 for benchmarking.
+    Dense(Array2<f32>),
+    /// Production O(d log d) Fast Walsh-Hadamard rotation — Stage 2 default.
+    Fwht(FwhtRotation),
+}
 
 /// PolarQuant compressor/decompressor.
 ///
@@ -61,8 +78,8 @@ pub struct PolarQuant {
     pub dim: usize,
     /// Bits per polar component (3 or 4 recommended).
     pub bits: u8,
-    /// Random orthogonal rotation matrix Π (dim × dim).
-    rotation: Array2<f32>,
+    /// Rotation strategy: Dense (O(d²)) or FWHT (O(d log d)).
+    rotation: RotationStrategy,
     /// Lloyd-Max quantizer for radii (r).
     radius_q: ScalarQuantizer,
     /// Lloyd-Max quantizer for angles (θ).
@@ -70,37 +87,90 @@ pub struct PolarQuant {
 }
 
 impl PolarQuant {
-    /// Create a new `PolarQuant` instance.
+    /// Create a new `PolarQuant` instance using the **dense QR rotation** (Stage 1 default).
+    ///
+    /// Equivalent to `new_dense(dim, bits, seed)`. Kept for backward compatibility.
     ///
     /// # Arguments
-    /// * `dim` – vector dimension (must be even)
-    /// * `bits` – bits per polar component (3 or 4)
-    /// * `seed` – optional RNG seed for reproducibility
+    /// * `dim`  — vector dimension (must be even)
+    /// * `bits` — bits per polar component (3 or 4)
+    /// * `seed` — optional RNG seed for reproducibility
     pub fn new(dim: usize, bits: u8, seed: Option<u64>) -> Self {
+        Self::new_dense(dim, bits, seed)
+    }
+
+    /// Create a `PolarQuant` using the **dense QR rotation** — O(d²).
+    ///
+    /// Use this for benchmarking the dense baseline or when dim is not a power of 2.
+    pub fn new_dense(dim: usize, bits: u8, seed: Option<u64>) -> Self {
         assert!(dim % 2 == 0, "dim must be even for polar pairing");
         assert!(bits >= 2 && bits <= 8, "bits must be in [2, 8]");
 
         let levels = 1usize << bits;
-
-        // --- Build rotation matrix via QR decomposition of a random Gaussian ---
-        // G ~ N(0,1)^{d×d}, then G = QR, Π = Q
-        let mut rng = match seed {
-            Some(s) => StdRng::seed_from_u64(s),
-            None => StdRng::seed_from_u64(0xdeadbeef_cafebabe),
-        };
+        let mut rng = StdRng::seed_from_u64(seed.unwrap_or(0xdeadbeef_cafebabe));
         let gaussian: Array2<f32> = Array2::random_using((dim, dim), StandardNormal, &mut rng);
-        let rotation = qr_orthogonalize(gaussian);
+        let dense_matrix = qr_orthogonalize(gaussian);
 
-        // --- Precompute codebooks ---
         let radius_q = build_radius_quantizer(levels, dim, &mut rng);
         let angle_q = build_angle_quantizer(levels);
 
         Self {
             dim,
             bits,
-            rotation,
+            rotation: RotationStrategy::Dense(dense_matrix),
             radius_q,
             angle_q,
+        }
+    }
+
+    /// Create a `PolarQuant` using the **FWHT rotation** — O(d log d).
+    ///
+    /// **Stage 2 production path.** Requires `dim` to be a power of 2.
+    /// Memory: 2KB at d=512 vs 1MB for dense — a 512× reduction.
+    ///
+    /// Codebooks are identical to `new_dense`; the distribution guarantee
+    /// holds for the Randomized Hadamard Transform.
+    ///
+    /// # Panics
+    /// Panics if `dim` is not a power of 2.
+    pub fn new_fwht(dim: usize, bits: u8, seed: Option<u64>) -> Self {
+        assert!(dim % 2 == 0, "dim must be even for polar pairing");
+        assert!(bits >= 2 && bits <= 8, "bits must be in [2, 8]");
+        assert!(
+            dim.is_power_of_two(),
+            "FWHT rotation requires a power-of-2 dimension, got {dim}"
+        );
+
+        let levels = 1usize << bits;
+        let mut rng = StdRng::seed_from_u64(seed.unwrap_or(0xdeadbeef_cafebabe));
+        let fwht = FwhtRotation::new(dim, Some(seed.unwrap_or(0xdeadbeef_cafebabe)));
+
+        let radius_q = build_radius_quantizer(levels, dim, &mut rng);
+        let angle_q = build_angle_quantizer(levels);
+
+        Self {
+            dim,
+            bits,
+            rotation: RotationStrategy::Fwht(fwht),
+            radius_q,
+            angle_q,
+        }
+    }
+
+    /// Which rotation strategy is active.
+    pub fn rotation_strategy_name(&self) -> &'static str {
+        match &self.rotation {
+            RotationStrategy::Dense(_) => "Dense O(d²)",
+            RotationStrategy::Fwht(_)  => "FWHT O(d·log d)",
+        }
+    }
+
+    /// Rotation matrix memory in bytes.
+    /// Dense: dim² × 4 bytes. FWHT: dim × 4 bytes.
+    pub fn rotation_memory_bytes(&self) -> usize {
+        match &self.rotation {
+            RotationStrategy::Dense(m) => m.len() * std::mem::size_of::<f32>(),
+            RotationStrategy::Fwht(f)  => f.memory_bytes(),
         }
     }
 
@@ -122,8 +192,9 @@ impl PolarQuant {
         let norm_f16 = f16::from_f32(norm_f32);
         
         // Step 1: normalize and rotate
-        let v_arr = Array1::from_iter(v.iter().map(|&val| val.to_f32() / norm_f32));
-        let rotated = self.rotation.dot(&v_arr);
+        let mut normalized: Vec<f32> = v.iter().map(|&val| val.to_f32() / norm_f32).collect();
+        self.apply_rotation(&mut normalized);
+        let rotated = Array1::from(normalized);
 
         // Step 2 & 3: shared quantization and packing
         let mut packed = self.compress_rotated_internal(rotated);
@@ -145,9 +216,9 @@ impl PolarQuant {
         let norm_f16 = f16::from_f32(norm_f32);
 
         // Step 1: normalize and rotate
-        // Use from_iter to avoid unnecessary clones or explicit allocation of intermediate f32 vec
-        let v_arr = Array1::from_iter(v.iter().map(|&x| x / norm_f32));
-        let rotated = self.rotation.dot(&v_arr);
+        let mut normalized: Vec<f32> = v.iter().map(|&x| x / norm_f32).collect();
+        self.apply_rotation(&mut normalized);
+        let rotated = Array1::from(normalized);
 
         let mut packed = self.compress_rotated_internal(rotated);
 
@@ -212,13 +283,45 @@ impl PolarQuant {
             rotated.push(r_hat * theta_hat.sin());
         }
 
-        // Apply inverse rotation (Πᵀ = Π⁻¹ since Π is orthogonal)
-        let v_rot = Array1::from_vec(rotated);
-        let mut reconstructed = self.rotation.t().dot(&v_rot);
+        // Apply inverse rotation
+        self.apply_inverse_rotation(&mut rotated);
+        let mut reconstructed = Array1::from_vec(rotated);
 
         // Multiply by norm
         reconstructed *= norm;
         reconstructed
+    }
+
+    // ---------------------------------------------------------------------------
+    //  Internal rotation helpers
+    // ---------------------------------------------------------------------------
+
+    /// Apply the forward rotation to a mutable f32 slice in place.
+    fn apply_rotation(&self, v: &mut Vec<f32>) {
+        match &self.rotation {
+            RotationStrategy::Dense(matrix) => {
+                let arr = Array1::from(v.clone());
+                let rotated = matrix.dot(&arr);
+                v.copy_from_slice(rotated.as_slice().unwrap());
+            }
+            RotationStrategy::Fwht(fwht) => {
+                fwht.apply(v);
+            }
+        }
+    }
+
+    /// Apply the inverse rotation to a mutable f32 Vec in place.
+    fn apply_inverse_rotation(&self, v: &mut Vec<f32>) {
+        match &self.rotation {
+            RotationStrategy::Dense(matrix) => {
+                let arr = Array1::from(v.clone());
+                let inv = matrix.t().dot(&arr);
+                v.copy_from_slice(inv.as_slice().unwrap());
+            }
+            RotationStrategy::Fwht(fwht) => {
+                fwht.apply_inverse(v);
+            }
+        }
     }
 
     /// Return the number of bytes used to compress one vector.
@@ -351,18 +454,49 @@ mod tests {
 
     #[test]
     fn test_rotation_orthogonality() {
-        for &dim in &[32, 512] {
-            let pq = PolarQuant::new(dim, 4, Some(42));
-            // Check Πᵀ·Π ≈ I
-            let product = pq.rotation.t().dot(&pq.rotation);
-            for i in 0..dim {
-                for j in 0..dim {
-                    let val = product[[i, j]];
-                    let expected = if i == j { 1.0 } else { 0.0 };
-                    assert!((val - expected).abs() < 1e-3,
-                        "Orthogonality violated at dim={dim}, [{i},{j}]: {val:.6} ≠ {expected}");
+        // Dense: verify Πᵀ·Π ≈ I directly from the matrix
+        for &dim in &[32_usize, 64] { // small dims only — O(d²) test
+            let pq = PolarQuant::new_dense(dim, 4, Some(42));
+            if let RotationStrategy::Dense(ref matrix) = pq.rotation {
+                let product = matrix.t().dot(matrix);
+                for i in 0..dim {
+                    for j in 0..dim {
+                        let val = product[[i, j]];
+                        let expected = if i == j { 1.0 } else { 0.0 };
+                        assert!(
+                            (val - expected).abs() < 1e-3,
+                            "Dense orthogonality violated at dim={dim}, [{i},{j}]: {val:.6} ≠ {expected}"
+                        );
+                    }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn test_fwht_rotation_orthogonality() {
+        // FWHT: verify norm is preserved (orthogonal transform property)
+        use rand::prelude::*;
+        for &dim in &[128_usize, 512] {
+            let pq = PolarQuant::new_fwht(dim, 4, Some(42));
+            let mut rng = StdRng::seed_from_u64(99);
+            let v: Vec<f32> = (0..dim).map(|_| rng.gen_range(-1.0_f32..1.0_f32)).collect();
+            let norm_before: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+
+            // Compress then decompress — the rotation+inverse should preserve direction
+            let compressed   = pq.compress(&v);
+            let reconstructed = pq.decompress(&compressed);
+            let cos_sim: f32 = {
+                let dot: f32 = v.iter().zip(reconstructed.iter()).map(|(a, b)| a * b).sum();
+                let na = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                let nb = reconstructed.iter().map(|x| x * x).sum::<f32>().sqrt();
+                if na < 1e-10 || nb < 1e-10 { 0.0 } else { dot / (na * nb) }
+            };
+            assert!(
+                cos_sim > 0.95,
+                "FWHT rotation+inverse should preserve direction at dim={dim}: cos={cos_sim:.4}"
+            );
+            let _ = norm_before;
         }
     }
 

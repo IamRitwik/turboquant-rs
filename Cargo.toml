@@ -1,8 +1,8 @@
 [package]
 name = "turboquant-rs"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Rust implementation of Google's TurboQuant KV-cache compression algorithm (arXiv:2504.19874)"
+description = "Rust implementation of Google's TurboQuant KV-cache compression algorithm (arXiv:2504.19874) — PolarQuant + FWHT + QJL"
 authors = ["Ritwik Mukhopadhyay"]
 license = "MIT"
 readme = "README.md"
@@ -23,8 +23,20 @@ path = "src/main.rs"
 name = "demo"
 path = "examples/demo.rs"
 
+[[example]]
+name = "full_pipeline"
+path = "examples/full_pipeline.rs"
+
 [[bench]]
 name = "compression"
+harness = false
+
+[[bench]]
+name = "fwht_vs_dense"
+harness = false
+
+[[bench]]
+name = "qjl_accuracy"
 harness = false
 
 [dependencies]

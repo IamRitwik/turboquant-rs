@@ -1,0 +1,8 @@
+{
+  "qjl_results": [
+    {"sketch_dim": 16, "mean_abs_ip_error": 0.171015, "top16_attention_overlap": 0.1250, "memory_overhead_fraction": 0.001953, "total_bytes": 196},
+    {"sketch_dim": 32, "mean_abs_ip_error": 0.129321, "top16_attention_overlap": 0.2500, "memory_overhead_fraction": 0.003906, "total_bytes": 198},
+    {"sketch_dim": 64, "mean_abs_ip_error": 0.088863, "top16_attention_overlap": 0.1250, "memory_overhead_fraction": 0.007812, "total_bytes": 202},
+    {"sketch_dim": 128, "mean_abs_ip_error": 0.058531, "top16_attention_overlap": 0.3125, "memory_overhead_fraction": 0.015625, "total_bytes": 210}
+  ]
+}

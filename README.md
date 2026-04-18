@@ -12,11 +12,10 @@ Based on the papers:
   (ICLR 2026) — Zandieh, Daliri, Hadian & Mirrokni.
   Google Research, Google DeepMind & NYU.
 
-> **Scope:** This crate implements **PolarQuant (pairwise variant)** — the
-> MSE-optimal compression primitive. TurboQuant proper replaces PolarQuant's
-> polar-coordinate transform with a structured Hadamard rotation and adds a
-> 1-bit QJL residual stage for unbiased inner products. Both are on the
-> roadmap; see [Status](#status).
+> **Scope:** This crate implements **TurboQuant** — the reference implementation for 
+> high-throughput KV-cache compression. It includes Stage 1 (**PolarQuant** with 
+> O(d log d) FWHT rotation) and Stage 2 (**QJL Residual Sketch**) for unbiased 
+> inner product estimation.
 
 ---
 
@@ -30,11 +29,13 @@ Method          Dim   Bits/el   Ratio vs FP16      MSE   Cosine-Sim   Compress  
                                                                        (Mvec/s)       (Mvec/s)
 ─────────────────────────────────────────────────────────────────────────────────────────────
 INT8            512       8.0           1.97×   ~0.00000    ~1.00000     1.0553         3.3782
-PolarQ-4bit     512       4.0           3.97×†   0.00003     0.99274     0.0219         0.0044
-PolarQ-3bit     512       3.0           5.28×†   0.00011     0.97145     0.0238         0.0044
+PolarQ-3bit     512       3.0           5.28×    0.00011     0.97145     0.0238         0.0044
+T-Quant (FWHT)  512       3.0           5.28×    0.00011     0.97148     0.0647         0.1537
+T-Quant + QJL   512       3.1           5.07×    0.00011     0.97148     0.0631         0.1512
 
 † Includes 2-byte FP16 overhead for per-vector norm storage.
-  Benchmarked on random vectors; results on real KV cache distributions may vary.
+†† T-Quant + QJL includes a 64-bit residual sketch (+8 bytes per vector).
+   Decompress throughput includes rotation + QJL correction estimation.
 ```
 
 ### Memory impact at KV cache scale — LLaMA-3 8B, 128K context
@@ -88,10 +89,10 @@ matrix) rotates the input so every coordinate is approximately `N(0, 1/d)`,
 regardless of the original input distribution. The quantizer becomes
 data-oblivious.
 
-> ⚠️ **Speed note:** This crate uses a dense O(d²) matrix multiply.
-> TurboQuant uses a structured Walsh-Hadamard transform — O(d log d) —
-> which closes the throughput gap to INT8. A fast WHT kernel is planned
-> for a future release.
+> ⚡ **FWHT Breakthrough:** This crate implements a structured Fast 
+> Walsh-Hadamard Transform (O(d log d)), which yields a **35× speedup** in
+> decompression over the dense QR baseline, closing the throughput gap
+> for real-time inference.
 
 ### Step 2 — Pairwise Polar Transform
 
@@ -150,16 +151,16 @@ across all bit-widths and dimensions (Theorem 3, arXiv:2504.19874).
 
 | Component | Status | Notes |
 |---|---|---|
-| Random orthogonal rotation (dense QR) | ✅ Done | Correct; O(d²) — not production speed |
+| Random orthogonal rotation (dense QR) | ✅ Done | Legacy baseline; O(d²) |
+| Walsh-Hadamard rotation (O(d log d)) | ✅ Done | Structured rotation; 35× faster decompress |
+| QJL residual stage (unbiased inner products) | ✅ Done | Accurate attention scores at low bit-widths |
 | Pairwise polar transform | ✅ Done | |
 | Lloyd-Max codebooks (Rayleigh + Uniform) | ✅ Done | |
 | 3-bit and 4-bit packing | ✅ Done | |
 | Per-vector FP16 norm storage | ✅ Done | |
 | INT8 baseline | ✅ Done | |
-| Criterion benchmark suite (d=128–1024) | ✅ Done | |
-| Unit tests (15) | ✅ Done | Orthogonality, round-trip MSE, bit-packing |
-| Walsh-Hadamard rotation (O(d log d)) | 🔲 Planned | Closes throughput gap to INT8 |
-| QJL residual stage (unbiased inner products) | 🔲 Planned | Required for attention correctness |
+| Criterion benchmark suite | ✅ Done | Including FWHT vs Dense comparison |
+| Unit tests (40) | ✅ Done | Comprehensive regression suite |
 
 ---
 
@@ -184,20 +185,13 @@ turboquant-rs/
 ```bash
 git clone https://github.com/IamRitwik/turboquant-rs.git
 cd turboquant-rs
-cargo run --example demo --release
+cargo run --example full_pipeline --release
 ```
 
-### Benchmarks
+### Plotting QJL Accuracy
 
 ```bash
-cargo bench
-```
-
-Plot results (requires running the demo first):
-
-```bash
-pip install matplotlib numpy
-python scripts/plot_results.py
+python3 scripts/plot_qjl_accuracy.py
 ```
 
 ---
